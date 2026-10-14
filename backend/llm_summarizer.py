@@ -361,13 +361,18 @@ def _strip_html(html_text: str) -> str:
 def extract_model_additions(analysis: str) -> list[str]:
     """抽出「模型补充」标注的断言文本，供检索核验。
 
-    两种形态：括号标注（内容在标注括号里，取冒号后的正文）与裸标注
-    （括号里只有「模型补充，未联网核验」，被标注的是前半句）。
+    三种形态：
+    1. 标注括号里带正文（「（模型补充，未联网核验：……）」）——取括号内正文；
+    2. 标注作前缀（「**（模型补充，未联网核验）**：正文」「- 〔模型补充…〕正文」）
+       ——断言是标注后面的那句话；
+    3. 裸标注作尾注（「…结论。（模型补充，未联网核验）」）——断言是标注前那句。
     """
     claims: list[str] = []
+    prev_para = ""
     # 免责声明句里也含「模型补充」字样，先删掉再抽取，否则它自己会被当成断言
     for para in re.split(r"\n\s*\n", strip_disclaimer(analysis)):
         if MODEL_ADDITION_MARK not in para:
+            prev_para = para
             continue
         spans = list(_MODEL_SPAN_RE.finditer(para))
         if not spans:
@@ -375,6 +380,7 @@ def extract_model_additions(analysis: str) -> list[str]:
             cleaned = re.sub(r"\s+", " ", cleaned).strip()
             if cleaned:
                 claims.append(cleaned)
+            prev_para = para
             continue
         for span in spans:
             inner = span.group(0)[1:-1]
@@ -382,14 +388,33 @@ def extract_model_additions(analysis: str) -> list[str]:
             if content and not _MARKER_BARE_RE.match(content):
                 claims.append(content)
                 continue
-            # 裸标注：断言是标注所在的那句话（标注前的文本）。
-            # 句号常在括号标注前（「…场景。（模型补充，未联网核验）」），
-            # 所以先吃掉尾部句读，再取最后一整句。
-            before = para[: span.start()].rstrip()
-            before = before.rstrip("。．.！!？?；;，,、")
-            sentence = re.split(r"[。！？!?\n]", before)[-1].strip()
-            if sentence:
-                claims.append(sentence)
+            # 裸标注：标注贴着行首（前面只剩 *、-、> 等排版符）时是前缀形态，
+            # 断言在标注后面；否则是尾注形态，断言是标注前那句。
+            line_start = para.rfind("\n", 0, span.start()) + 1
+            line_prefix = para[line_start : span.start()]
+            leading = bool(re.fullmatch(r"[*_#>\-\s]*", line_prefix))
+            claim = ""
+            if leading:
+                after = re.sub(r"^[\s*_#>：:；;，,、\-—]*", "", para[span.end() :])
+                match = re.match(r"([^。！？!?\n]{2,400}?)(?:[。！？!?\n]|$)", after)
+                claim = (match.group(1) if match else "").strip(" \t*_#>—-")
+            if not claim:
+                # 尾注形态：句号常在括号标注前（「…场景。（模型补充，未联网核验）」），
+                # 所以先吃掉尾部句读与排版符，再取最后一整句。
+                before = para[: span.start()].rstrip()
+                before = before.rstrip("。．.！!？?；;，,、")
+                before = re.sub(r"[\s*_#>—\-]+$", "", before)
+                sentence = re.split(r"[。！？!?\n]", before)[-1].strip(" \t*_#>—-")
+                if sentence:
+                    claim = sentence
+                elif prev_para.strip():
+                    # 标注独占一行/一段：被标注的是上一段最后一句
+                    claim = re.split(r"[。！？!?\n]", prev_para.strip())[-1].strip(
+                        " \t*_#>—-"
+                    )
+            if claim:
+                claims.append(claim)
+        prev_para = para
     # 去重、限流查询数
     unique: list[str] = []
     for claim in claims:

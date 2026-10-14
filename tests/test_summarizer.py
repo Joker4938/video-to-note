@@ -1900,6 +1900,30 @@ def test_extract_model_additions_covers_both_marker_shapes() -> None:
     assert "实际协议以仓库 LICENSE 文件为准" in claims[2]
 
 
+def test_extract_model_additions_handles_marker_as_prefix_label() -> None:
+    """标注作行首前缀（加粗括号/列表项）时，断言在标注后面（真笔记形态）。"""
+    from backend.llm_summarizer import extract_model_additions
+
+    analysis = (
+        "前文分析。\n\n"
+        "**（模型补充，未联网核验）**：类似的多网卡聚合工具常受链路延迟差异影响。\n\n"
+        "- 〔模型补充，未联网核验〕历史上 Gemma 系列采用谷歌自有条款而非 Apache 2.0。\n\n"
+        "**【模型补充，未联网核验】** 一般来说，AI 视频生成在时长上弱于图片生成。\n\n"
+        "结论是它适合轻量场景。（模型补充，未联网核验）"
+    )
+    claims = extract_model_additions(analysis)
+    assert len(claims) == 4
+    # 前缀形态：断言是标注后的那句，不是排版符也不是标注自身
+    assert "多网卡聚合工具常受链路延迟差异影响" in claims[0]
+    assert "历史上 Gemma 系列采用谷歌自有条款" in claims[1]
+    assert "AI 视频生成在时长上弱于图片生成" in claims[2]
+    # 尾注形态照旧：断言在标注前
+    assert "结论是它适合轻量场景" in claims[3]
+    for claim in claims:
+        assert claim not in {"**", "-", "*"}
+        assert "未联网核验" not in claim
+
+
 def test_strip_disclaimer_removes_only_the_blanket_sentence() -> None:
     from backend.llm_summarizer import strip_disclaimer
 
