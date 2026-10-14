@@ -125,6 +125,7 @@ python "<本技能目录>/scripts/notes_audit.py" favs.json
 | 同视频出现 `-2.md` | 孪生提交；删多余的，检查是否两个驱动在跑 |
 | 笔记无 `## xxx [MM:SS-MM:SS]` | 出稿没按时间戳版式（或空转写占位稿）；兜底重写 |
 | 归档 .md 有截图，但网页端/任务目录里看不到 | 截图只写进了归档、没回写任务镜像；重跑 `shotfill.py` 自动迁移到 `frames/` + 镜像方案 |
+| 笔记带「模型补充，未联网核验」免责声明 | 新出稿已自动联网核验改写（附（来源：…））；存量笔记跑 `verify_claims.py` 补扫，之后 `shotfill.py` 刷镜像 |
 | 控制台 UnicodeEncodeError | Windows GBK；脚本已 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` |
 | 并行提交任务 | 服务默认单任务队列；串行等待，避免孪生与 GPU 争抢 |
 
@@ -137,5 +138,6 @@ python "<本技能目录>/scripts/notes_audit.py" favs.json
 | `batch_notes.py` | 串行批量出笔记，磁盘笔记断点续跑 | `FAVS_JSON` `VIDEOTONOTES_NOTES_DIR` `BATCH_LOG` |
 | `shotfill.py` | 按时间戳回填内容对齐截图 | `VIDEOTONOTES_NOTES_DIR` `FFMPEG` `FFPROBE` |
 | `notes_audit.py` | 质检：孪生/残缺/缺图/覆盖不足 | `VIDEOTONOTES_NOTES_DIR` |
+| `verify_claims.py` | 存量笔记「模型补充」联网核验改写（用服务同款 .venv python 跑） | `VIDEOTONOTES_NOTES_DIR` `VIDEOTONOTONOTE_SRC` |
 
 全部脚本：Windows 上用 `python`（不要 `python3`），服务地址默认 `http://127.0.0.1:8000`。
