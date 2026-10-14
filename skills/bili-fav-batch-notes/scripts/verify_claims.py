@@ -11,7 +11,7 @@
 
 Usage:
   <video-to-note-src>/.venv/Scripts/python.exe verify_claims.py [note.md ...]
-  无参数：扫 VIDEOTONOTES_NOTES_DIR 下全部含「模型补充」的笔记
+  无参数或无有效文件参数：扫 VIDEOTONOTES_NOTES_DIR 下全部含「模型补充」的笔记
   环境变量：VIDEOTONOTES_NOTES_DIR  VIDEOTONOTONOTE_SRC（backend 导入路径）
             VIDEOTONOTE_LLM_BASE_URL  VIDEOTONOTE_LLM_MODEL
 
@@ -24,6 +24,7 @@ import io
 import os
 import re
 import sys
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -80,8 +81,9 @@ async def verify_note(summarizer, path, text):
 
 
 def main():
-    targets = [sys.argv[1]] if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]) \
-        else sorted(glob.glob(os.path.join(NOTES_DIR, "*.md")))
+    targets = [a for a in sys.argv[1:] if os.path.isfile(a)]
+    if not targets:
+        targets = sorted(glob.glob(os.path.join(NOTES_DIR, "*.md")))
     queue = []
     for path in targets:
         try:
@@ -95,7 +97,7 @@ def main():
         return
 
     workspace = os.path.join(NOTES_DIR, os.pardir)
-    store = ConfigStore(os.path.abspath(workspace))
+    store = ConfigStore(Path(os.path.abspath(workspace)))
     resolved = store.resolve_stored_key(model_type="custom", base_url=LLM_BASE_URL)
     api_key = str(resolved.get("api_key") or "")
     if not api_key:
