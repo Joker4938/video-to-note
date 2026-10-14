@@ -1887,14 +1887,17 @@ def test_extract_model_additions_covers_both_marker_shapes() -> None:
     analysis = (
         "视频讲了工具A的取舍。（模型补充，未联网核验：ComfyUI 是基于节点图的 Stable Diffusion 工作流工具。）\n\n"
         "结论是它适合轻量场景。（模型补充，未联网核验）\n\n"
+        "许可证是宽松的。（模型补充，未联网核验；实际协议以仓库 LICENSE 文件为准）\n\n"
         "以上是点评。"
     )
     claims = extract_model_additions(analysis)
-    assert len(claims) == 2
+    assert len(claims) == 3
     assert "ComfyUI" in claims[0]
     assert "未联网核验" not in claims[0]
     # 裸标注：断言是被标注的那句话
     assert "结论是它适合轻量场景" in claims[1]
+    # 分号分隔的标注正文也要抽出来（真笔记里出现过）
+    assert "实际协议以仓库 LICENSE 文件为准" in claims[2]
 
 
 def test_strip_disclaimer_removes_only_the_blanket_sentence() -> None:
