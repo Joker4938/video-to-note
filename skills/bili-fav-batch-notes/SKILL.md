@@ -53,6 +53,7 @@ python "<本技能目录>/scripts/batch_notes.py" BV1xxxxxxx  # 只跑一个
 ```
 
 - **串行**提交 `/api/summarize`，一个跑完再跑下一个（服务默认单任务队列；并行提交会产生孪生笔记）。
+- **多分 P 视频**：条目 URL 用 `?p=N` 出单 P 笔记（归档名自动带【P{n} 分P名】）；条目加 `pages: [14,15,16,17]` 则几 P 合一篇（显式下发 `bilibili_pages`，URL 的 `?p=` 取组内首个页码作身份标记）。**绝不能裸提交多 P 总链接**——全部分 P 会合并成一篇。断点续跑按「BV+分P」去重（分 P 共用 BV，只按 BV 去重会首篇完成就跳过其余分 P）。
 - 配置固定：`summary_style: "detailed"` + `processing_mode: "reuse"`（同链接已有转录直接复用，快且省 token）+ `prefer_subtitles: true` + whisper `belle-turbo-zh`。LLM 通道在脚本顶部 `SUBMIT.llm_config` 里改；`api_key: ""` 表示沿用本机已存 Key（HTTP 接口的 llm_config 必填，留空即可复用）。
 - **断点续跑**：驱动以「磁盘上已有笔记的来源 BV 号」为权威完成记录（读笔记页脚 `来源：`），叠加任务历史。直接重跑即续。
   - **坑**：`/api/tasks` 只返回最近 20 条左右，绝不能只靠任务历史判断完成——重启后旧完成项会被挤出窗口、误判未做、重复出稿。磁盘笔记才是权威。

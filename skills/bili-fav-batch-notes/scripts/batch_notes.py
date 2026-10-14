@@ -75,8 +75,25 @@ def norm_bvid(s):
     return m.group(0) if m else ""
 
 
+def ident_from_src(src):
+    """Done-set key: BV + page for multi-P URLs (?p=N), bare BV otherwise.
+
+    分 P 条目共用一个 BV 号，只按 BV 去重会让第一篇完成就跳过其余分 P，
+    所以把 ?p=N 一并编进身份；无 p 参数的旧笔记保持裸 BV，互不冲突。
+    """
+    bvid = norm_bvid(src)
+    if not bvid:
+        return ""
+    m = re.search(r"[?&]p=(\d+)", src or "")
+    return f"{bvid}#p{m.group(1)}" if m else bvid
+
+
+def entry_ident(v):
+    return ident_from_src(v.get("url") or "") or v.get("bvid", "")
+
+
 def completed_bvids():
-    """bvids that already have an archived note, plus completed task history.
+    """ids that already have an archived note, plus completed task history.
 
     Notes on disk are the authoritative record: /api/tasks only returns a
     bounded window of recent tasks, so restarts must not depend on it alone.
@@ -88,9 +105,9 @@ def completed_bvids():
         except Exception:
             continue
         m = SRC_RE.search(text)
-        bvid = norm_bvid(m.group(1)) if m else ""
-        if bvid:
-            done.add(bvid)
+        ident = ident_from_src(m.group(1)) if m else ""
+        if ident:
+            done.add(ident)
     try:
         d = http_json(LOCAL + "/api/tasks")
     except Exception:
@@ -107,9 +124,9 @@ def completed_bvids():
         except Exception:
             continue
         src = detail.get("source_url") or (detail.get("task") or {}).get("source_url")
-        bvid = norm_bvid(src) or norm_bvid(t.get("source_url") or "")
-        if bvid:
-            done.add(bvid)
+        ident = ident_from_src(src) or ident_from_src(t.get("source_url") or "")
+        if ident:
+            done.add(ident)
     return done
 
 
@@ -173,11 +190,15 @@ def main():
         if title == UNAVAILABLE_TITLE:
             log({"event": "skip_unavailable", "bvid": v["bvid"]})
             continue
-        if v["bvid"] in done:
-            log({"event": "skip_done", "bvid": v["bvid"], "title": title})
+        if entry_ident(v) in done:
+            log({"event": "skip_done", "bvid": entry_ident(v), "title": title})
             continue
 
         payload = dict(SUBMIT, video_url=url)
+        # 多分 P 合并出稿：条目带 pages 字段时显式下发 bilibili_pages
+        # （URL 上的 ?p=N 只标记本条身份；范围以 pages 为准）。
+        if v.get("pages"):
+            payload["bilibili_pages"] = [int(x) for x in v["pages"]]
         submitted = None
         for attempt in range(6):
             try:
