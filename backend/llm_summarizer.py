@@ -83,7 +83,7 @@ MAX_EFFORT_BUDGET_MULTIPLIER = 5
 # 输出 token——额度不够时挤掉的是正文（用户实测：一次压缩请求思考 4505 字 / 正文 0）。
 # 同一进程内按 (provider, model, base_url) 记住，第一次请求之后就会自动放宽。
 # DeepSeek 兼容通道不走这里，它已有 MAX_EFFORT_BUDGET_MULTIPLIER 那套膨胀机制。
-THINKING_RESERVE_TOKENS = 2_000
+THINKING_RESERVE_TOKENS = 12_000
 _THINKING_SEEN_CHANNELS: set[tuple[str, str, str]] = set()
 # auto 档在 DeepSeek 兼容通道的默认推理档位：开思考（high）。
 # 2026-10-03 同一份 25 分钟转录（13952 字 / 167 段）三档对照：off 36 秒出 30 个小节、
@@ -1496,6 +1496,7 @@ class LLMSummarizer:
         param_attempts: int = MAX_PARAM_RETRIES,
         budget: str = "auto",
         connection_retries: int = 1,
+        prior_outcome: str = "",
     ) -> str:
         if should_abort is not None and should_abort():
             raise asyncio.CancelledError("任务已取消")
@@ -1623,6 +1624,8 @@ class LLMSummarizer:
                 f"实际收到 思考 {reasoning_characters} 字 / 正文 0 字，"
                 f"finish_reason={finish_reason}"
             )
+            if prior_outcome:
+                outcome = f"{prior_outcome}；改为不下发额度上限后 {outcome}"
             if retry_empty and effort != "off" and self._can_disable_thinking():
                 warning = (
                     f"{stage}：模型未返回正文（{outcome}），"
@@ -1634,13 +1637,36 @@ class LLMSummarizer:
                     prompt,
                     max_tokens,
                     "off",
-                    retry_empty=False,
+                    retry_empty=retry_empty,
                     progress_callback=progress_callback,
                     progress=progress,
                     stage=stage,
                     should_abort=should_abort,
                     param_attempts=param_attempts,
                     budget=budget,
+                )
+            if retry_empty and budget != "omit" and finish_reason == "length":
+                # 思考链吃满输出额度：去掉我们下发的额度上限再试一次，交给网关默认值。
+                # 关不掉思考的通道（custom/ollama）上这是唯一出路——既绕开「我方预算
+                # 不够」，也绕开「网关把 max_tokens 静默砍小」。
+                warning = (
+                    f"{stage}：模型未返回正文（{outcome}），"
+                    "多为思考链吃满输出额度，已改为不下发输出额度上限后重试"
+                )
+                self.warnings.append(warning)
+                await self._report_progress(progress_callback, progress, warning)
+                return await self._complete(
+                    prompt,
+                    max_tokens,
+                    effort,
+                    retry_empty=False,
+                    progress_callback=progress_callback,
+                    progress=progress,
+                    stage=stage,
+                    should_abort=should_abort,
+                    param_attempts=param_attempts,
+                    budget="omit",
+                    prior_outcome=outcome,
                 )
             # 已经关过思考却仍只收到思考 ⇒ 这条通道不认我们的关闭请求，再劝"关闭深度
             # 思考"就是把人往死胡同里带（1.4.2 群测实测：off 档下发后仍累计 6473 字

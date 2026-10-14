@@ -1716,8 +1716,12 @@ async def test_channel_ignoring_thinking_off_says_so_instead_of_repeating_advice
     assert "该通道没有响应关思考的请求" in text
     assert "可尝试关闭深度思考" not in text
     assert "思考 6473 字 / 正文 0 字" in text
-    assert "max_tokens=4600" in text
-    assert len(requests) == 1  # 已经是 off，不该再白跑一次"关掉思考"的重试
+    assert "max_tokens=4600" in text  # 首次尝试的额度仍留在报错里，诊断不丢
+    # 已经是 off，不该再白跑一次"关掉思考"的同轴重试；但可以有一次不同轴的
+    # 「不下发额度上限」重试（交给网关默认值），失败后报错会并排记两次尝试
+    assert len(requests) == 2
+    assert "max_tokens" not in requests[1]
+    assert "max_completion_tokens" not in requests[1]
 
 
 @pytest.mark.asyncio
