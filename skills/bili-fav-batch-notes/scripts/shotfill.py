@@ -416,8 +416,13 @@ def fill_note(note_path):
 
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
-    if len(sys.argv) > 1:
-        fill_note(sys.argv[1])
+    targets = [a for a in sys.argv[1:] if os.path.isfile(a)]
+    if targets:
+        for np in targets:
+            try:
+                fill_note(np)
+            except Exception as e:
+                print(f"error on {os.path.basename(np)}: {e}")
         return
     notes = sorted(glob.glob(os.path.join(NOTES_DIR, "*.md")))
     print(f"scanning {len(notes)} notes")
