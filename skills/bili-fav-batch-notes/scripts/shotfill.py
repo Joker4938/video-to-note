@@ -138,6 +138,46 @@ def extract_frame(video, t, out_path, width=1280):
     return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
 
 
+def page_offset_table(task_dir):
+    """合并时间轴 → 各分 P 本地时间映射：从任务转录的【P{n} …】标记推每 P 起点。
+
+    多分 P 合并稿的时间轴是各 P 累计偏移的；只按页脚 URL 下载得到的是第一个
+    P 的视频，其后所有截图都会被夹到片尾那一帧（内容与小节完全对不上）。
+    返回 [(page, start_sec), ...]；单 P 或无标记返回 []（走单视频路径）。
+    """
+    tp = os.path.join(task_dir, "transcript.json")
+    if not os.path.isfile(tp):
+        return []
+    try:
+        segs = json.load(io.open(tp, encoding="utf-8")).get("segments") or []
+    except (OSError, ValueError):
+        return []
+    marks = []
+    for seg in segs:
+        m = re.match(r"【P(\d+)\s", str(seg.get("text") or ""))
+        if m:
+            marks.append((int(m.group(1)), float(seg.get("start") or 0)))
+    marks.sort(key=lambda item: item[1])
+    seen, unique = set(), []
+    for page, start in marks:
+        if page in seen:
+            continue
+        seen.add(page)
+        unique.append((page, start))
+    return unique if len(unique) > 1 else []
+
+
+def map_to_page(t, offsets):
+    """累计时间轴上的秒数 → (分 P 号, 该分 P 内本地秒)。"""
+    page, start = offsets[0]
+    for p, s in offsets:
+        if s <= t + 1e-6:
+            page, start = p, s
+        else:
+            break
+    return page, max(0.0, t - start)
+
+
 def section_targets(start: int, end: int):
     """Screenshot timestamps inside a section."""
     span = max(end - start, 1)
@@ -273,37 +313,67 @@ def fill_note(note_path):
         img_dir = os.path.join(IMAGES_DIR, bvid)
         def link_of(name): return f"images/{bvid}/{name}"
 
-    # collect every target timestamp first, one download for all frames
-    plan = []  # (line_index, [t...])
+    # collect every target timestamp first；多分 P 合并稿要把累计时间映射到
+    # 各分 P 的本地时间，再逐 P 下载抽帧（只下页脚那一个 P 会把后面所有截图
+    # 夹到片尾同一帧）。
+    offsets = page_offset_table(task_dir) if task_dir else []
+    plan = []  # (line_index, [(page|None, merged_t, local_t), ...])
     for idx, _h, s, e in sections:
-        plan.append((idx, section_targets(s, e)))
+        entries = []
+        for t in section_targets(s, e):
+            if offsets:
+                page, local = map_to_page(t, offsets)
+                entries.append((page, float(t), local))
+            else:
+                entries.append((None, float(t), float(t)))
+        plan.append((idx, entries))
 
     tmpdir = tempfile.mkdtemp(prefix="shotfill_")
-    video = os.path.join(tmpdir, "video.bin")
     cookies = get_cookies()
-    print(f"downloading {bvid} ...")
-    ok, err = download_video(url, video, cookies)
-    if not ok:
-        print(f"download failed for {bvid}: {err}")
-        return False
-    dur = video_duration(video)
-    if dur <= 0:
-        print(f"cannot probe duration for {bvid}")
-        os.remove(video)
-        return False
+    videos: dict = {}      # page|None -> 视频路径或 None
+    durations: dict = {}   # page|None -> 秒
+
+    def get_video(page):
+        if page in videos:
+            return videos[page]
+        video_url = url
+        if page is not None:
+            video_url = re.sub(r"([?&])p=\d+", rf"\g<1>p={page}", url)
+            if "p=" not in video_url:
+                video_url += ("&" if "?" in video_url else "?") + f"p={page}"
+        path = os.path.join(tmpdir, f"video_{page}.bin")
+        label = f"{bvid} p={page}" if page is not None else bvid
+        print(f"downloading {label} ...")
+        ok, err = download_video(video_url, path, cookies)
+        if not ok:
+            print(f"download failed for {label}: {err}")
+            videos[page] = None
+            return None
+        dur = video_duration(path)
+        if dur <= 0:
+            print(f"cannot probe duration for {label}")
+            videos[page] = None
+            return None
+        videos[page] = path
+        durations[page] = dur
+        return path
 
     os.makedirs(img_dir, exist_ok=True)
     shots = 0
     inject = {}  # line_index -> [link, ...]
     n = 0
-    for idx, targets in plan:
+    for idx, entries in plan:
         links = []
-        for t in targets:
-            tc = max(0, min(t, int(dur) - 1))
+        for page, merged_t, local in entries:
             n += 1
+            video = get_video(page)
+            if not video:
+                continue
+            tc = max(0, min(int(local), int(durations[page]) - 1))
+            # 文件名时间用合并时间轴，和小节标题 [MM:SS-MM:SS] 对得上
             # task frames share one dir with the service's own shots: prefix the
             # bvid. the fallback dir is already per-bvid, plain names there.
-            stem = f"s{n:02d}_{fmt_ts(tc)}.jpg"
+            stem = f"s{n:02d}_{fmt_ts(int(merged_t))}.jpg"
             name = f"{bvid}_{stem}" if use_task else stem
             out = os.path.join(img_dir, name)
             if extract_frame(video, tc, out):
@@ -311,11 +381,16 @@ def fill_note(note_path):
                 shots += 1
         if links:
             inject[idx] = links
+    for video in videos.values():
+        if video:
+            try:
+                os.remove(video)
+            except OSError:
+                pass
     try:
-        os.remove(video)
+        os.rmdir(tmpdir)
     except OSError:
         pass
-    os.rmdir(tmpdir) if not os.listdir(tmpdir) else None
 
     if not inject:
         print(f"no frames extracted for {bvid}")

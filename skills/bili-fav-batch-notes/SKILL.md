@@ -67,7 +67,7 @@ python "<本技能目录>/scripts/shotfill.py"           # 扫全部缺截图的
 python "<本技能目录>/scripts/shotfill.py" <笔记路径>  # 单篇
 ```
 
-- 解析 `## 标题 [MM:SS-MM:SS]`，每约 2 分钟跨度取 1 帧（小节中点，上限 4 帧/节），yt-dlp 下载 ≤720p，ffmpeg 抽帧。
+- 解析 `## 标题 [MM:SS-MM:SS]`，每约 2 分钟跨度取 1 帧（小节中点，上限 4 帧/节），yt-dlp 下载 ≤720p，ffmpeg 抽帧。**多分 P 合并稿自动逐 P 映射**：合并时间轴按转录【P{n}】标记折算到各分 P 本地时间、逐 P 下载抽帧；只下页脚那一个 P 会把后面所有截图夹到片尾同一帧（文件名时间戳用合并时间轴，与小节区间一致）。
 - **落盘走服务原生截图方案**，保证网页端/导出/磁盘三种查看方式都能显示：
   - 帧写入 `workspace/<task_id>/frames/<bvid>_sNN_MMmSSs.jpg`（与服务自带截图同目录）；
   - 归档笔记（`workspace/notes/<title>.md`）里链接为 `../<task_id>/frames/<file>`（从 notes/ 目录就地看图）；
@@ -126,7 +126,8 @@ python "<本技能目录>/scripts/notes_audit.py" favs.json
 | 笔记无 `## xxx [MM:SS-MM:SS]` | 出稿没按时间戳版式（或空转写占位稿）；兜底重写 |
 | 归档 .md 有截图，但网页端/任务目录里看不到 | 截图只写进了归档、没回写任务镜像；重跑 `shotfill.py` 自动迁移到 `frames/` + 镜像方案 |
 | 笔记带「模型补充，未联网核验」免责声明 | 新出稿已自动联网核验改写（附（来源：…））；存量笔记跑 `verify_claims.py` 补扫，之后 `shotfill.py` 刷镜像 |
-| 多分 P 合组笔记只覆盖一个 P，或各篇内容串成同一讲 | 旧版服务转录复用按整 BV 匹配（`?p=14` 吃掉 `?p=33` 的转录）、单页字幕捷径截断合并范围；7cdfec6 起复用对齐 `?p=`+勾选范围、显式 `bilibili_pages` 直走合并通道。**质检必看**：各篇小节主题要对得上分 P 标题，合组笔记要含【P15…】等分 P 标记段 |
+| 多分 P 合组笔记只覆盖一个 P，或各篇内容串成同一讲 | 旧版服务转录复用按整 BV 匹配（`?p=14` 吃掉 `?p=33` 的转录）、单页字幕捷径截断合并范围；7cdfec6 起复用对齐 `?p=`+勾选范围、显式 `bilibili_pages` 直走合并通道。**质检必看**：各篇小节主题对得上分 P 标题；小节时间轴要覆盖全片（对照笔记头「时长」，超过 90 秒空洞/尾部缺口即是漏内容，转录里有、稿子没写） |
+| 删了笔记想强制重跑，驱动却直接 skip_done | 驱动的完成判定=磁盘笔记∪任务历史；任务目录还在时历史照样算完成。强制重生成要直接 `POST /api/summarize`（processing_mode=reuse 会复用任务目录里的转录，只重跑出稿），或先把任务目录移出 workspace |
 | 控制台 UnicodeEncodeError | Windows GBK；脚本已 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` |
 | 并行提交任务 | 服务默认单任务队列；串行等待，避免孪生与 GPU 争抢 |
 
