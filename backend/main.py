@@ -76,6 +76,7 @@ from .video_processor import (
     bilibili_page_url,
     merge_bilibili_pages,
     normalize_video_input,
+    select_bili_pages,
 )
 from .paraformer_asr import ParaformerTranscriber
 from .whisper_asr import WhisperTranscriber
@@ -594,8 +595,43 @@ def normalize_source_url(value: str) -> str:
     if parsed.port:
         netloc = f"{hostname}:{parsed.port}"
     path = parsed.path.rstrip("/")
-    query = "" if hostname == "bilibili.com" or hostname.endswith(".bilibili.com") else parsed.query
+    query = parsed.query
+    if hostname == "bilibili.com" or hostname.endswith(".bilibili.com"):
+        # 分享参数（spm_id_from 等）不参与身份识别，但 ?p= 必须保留：
+        # 同一 BV 下各分 P 是不同内容，剥掉 p 会让 ?p=33 的转录被 ?p=14
+        # 的任务复用（多分 P 批量会整批串页，笔记内容全错）。
+        query = "&".join(
+            part
+            for part in parsed.query.split("&")
+            if part.split("=", 1)[0] == "p"
+        )
     return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
+
+
+def _bili_video_key(normalized_url: str) -> str:
+    """去掉 ?p= 的视频级身份：同一 BV 各分 P 属同一视频（预勾选等场景用）。"""
+    parsed = urlsplit(normalized_url or "")
+    hostname = (parsed.hostname or "").lower()
+    if hostname != "bilibili.com" and not hostname.endswith(".bilibili.com"):
+        return normalized_url or ""
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _task_bili_pages(task_dir: Path) -> list[int]:
+    """任务清单里记录的显式分 P 勾选；无记录/未勾选视为单 P 语义（空列表）。"""
+    manifest_path = task_dir / "task.json"
+    if not manifest_path.is_file():
+        return []
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8")).get("bilibili_pages")
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    try:
+        return sorted(int(page) for page in raw)
+    except (ValueError, TypeError):
+        return []
 
 
 def source_url_from_task(task_dir: Path) -> str | None:
@@ -619,8 +655,17 @@ def source_url_from_task(task_dir: Path) -> str | None:
     return None
 
 
-def find_reusable_task(source_url: str) -> str | None:
+def find_reusable_task(
+    source_url: str, bilibili_pages: list[int] | None = None
+) -> str | None:
+    """找「同一覆盖范围」的可复用转录任务。
+
+    除链接身份（B 站保留 ?p=）外还要对齐显式分 P 勾选：`?p=14` 的单 P
+    转录不能喂给 [14,15,16,17] 的合并任务，反之亦然——覆盖范围不同，
+    复用就是内容不完整。
+    """
     normalized_source = normalize_source_url(source_url)
+    wanted_pages = sorted(int(page) for page in (bilibili_pages or []))
     candidates = sorted(
         (path for path in WORKSPACE_DIR.iterdir() if path.is_dir()),
         key=lambda path: path.stat().st_mtime,
@@ -630,8 +675,11 @@ def find_reusable_task(source_url: str) -> str | None:
         if not (candidate / "transcript.json").is_file():
             continue
         existing_source = source_url_from_task(candidate)
-        if existing_source and normalize_source_url(existing_source) == normalized_source:
-            return candidate.name
+        if not existing_source or normalize_source_url(existing_source) != normalized_source:
+            continue
+        if _task_bili_pages(candidate) != wanted_pages:
+            continue
+        return candidate.name
     return None
 
 
@@ -826,7 +874,9 @@ async def submit_video_task(
     if request.processing_mode == "restart":
         reused_task_id = None
     elif not reused_task_id and request.video_url:
-        reused_task_id = find_reusable_task(request.video_url)
+        reused_task_id = find_reusable_task(
+            request.video_url, getattr(request, "bilibili_pages", None)
+        )
 
     if reused_task_id:
         resume_dir = task_directory(reused_task_id)
@@ -1313,7 +1363,10 @@ def previous_bili_pages(normalized_url: str) -> list[int] | None:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if manifest.get("normalized_source_url") != normalized_url:
+        # 预勾选按「同一视频」匹配（忽略 ?p=），跨分 P 沿用上次范围
+        if _bili_video_key(str(manifest.get("normalized_source_url") or "")) != (
+            _bili_video_key(normalized_url)
+        ):
             continue
         pages = manifest.get("bilibili_pages")
         if isinstance(pages, list) and pages:
@@ -1909,6 +1962,7 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
         cookie = douyin_cookie if source_kind == VideoSource.DOUYIN else bili_cookie
         transcript_result = load_transcript_result(resume_dir) if resume_dir else None
         bili_pages_to_transcribe: list = []
+        subtitle_outcome = None
 
         if transcript_result:
             set_progress(task, 1, "恢复任务信息", 8, "正在读取已有任务信息")
@@ -1939,7 +1993,18 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
             )
         elif request.prefer_subtitles and not is_local:
             set_progress(task, 2, "查找平台字幕", 16, "正在查找平台字幕")
-            subtitle = await video_processor.fetch_subtitles(source_url or "", info, cookie)
+            is_bilibili = (
+                video_processor.detect_source(source_url or "") == VideoSource.BILIBILI
+            )
+            # 显式勾选了分 P 时不能走单页字幕捷径：那只会拿到 URL 上那一个
+            # P 的字幕，合并任务的覆盖范围会被缩回一个分 P（内容不完整）。
+            # 交给 fetch_bilibili_subtitles 按 only_pages 覆盖全部勾选页。
+            multi_page_requested = is_bilibili and bool(request.bilibili_pages)
+            subtitle = (
+                None
+                if multi_page_requested
+                else await video_processor.fetch_subtitles(source_url or "", info, cookie)
+            )
             if subtitle:
                 transcript_result = {
                     "segments": subtitle.segments,
@@ -1950,10 +2015,6 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                     f"已使用平台字幕：{subtitle.language}，共 {len(subtitle.segments)} 段"
                 )
             else:
-                is_bilibili = (
-                    video_processor.detect_source(source_url or "")
-                    == VideoSource.BILIBILI
-                )
                 subtitle_outcome = (
                     await video_processor.fetch_bilibili_subtitles(
                         source_url or "", cookie, only_pages=request.bilibili_pages or None
@@ -2022,6 +2083,35 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                     task["logs"].append("未找到可用平台字幕，将进行语音转写")
             title = info["title"]
 
+        if (
+            transcript_result is None
+            and not bili_pages_to_transcribe
+            and not is_local
+            and request.bilibili_pages
+            and source_kind == VideoSource.BILIBILI
+        ):
+            # 显式勾了分 P 但没走字幕通道（prefer_subtitles=false）：按勾选
+            # 范围逐 P 语音转写再合并，不能只转 URL 上那一个 P
+            video = await video_processor.bilibili_video_pages(source_url or "", cookie)
+            if video and video.pages:
+                selected = select_bili_pages(
+                    video.pages, request.bilibili_pages, source_url or ""
+                )
+                bili_pages_to_transcribe = list(selected)
+                if len(video.pages) > 1:
+                    info["bili_pages"] = [
+                        {"page": page.page, "part": page.part} for page in selected
+                    ]
+                    info["bili_total_pages"] = len(video.pages)
+                    info["duration"] = (
+                        sum(float(page.duration or 0) for page in selected)
+                        or info.get("duration")
+                    )
+                    update_task_manifest(task_id, info)
+                task["logs"].append(
+                    f"按显式分 P 选择逐 P 语音转写：{_format_page_nums(selected)}"
+                )
+
         raise_if_cancel_requested(task)
         if transcript_result is None or bili_pages_to_transcribe:
             set_progress(task, 3, "准备音频", 25, "正在准备音频")
@@ -2072,31 +2162,29 @@ async def process_video_task(task_id: str, request: SummarizeRequest) -> None:
                             f"所选 Whisper {whisper_result['requested_model']} 未缓存或无法加载，"
                             f"已自动降级为本机缓存的 {whisper_result['model']}"
                         )
-                if subtitle_outcome is not None and subtitle_outcome.pages:
-                    merged_segments, language = merge_bilibili_pages(
-                        subtitle_outcome.pages,
-                        dict(subtitle_outcome.subtitle_by_page),
-                        whisper_by_page,
-                    )
-                else:
-                    merged_segments = [
-                        seg
-                        for whisper in whisper_by_page.values()
-                        for seg in (whisper.get("segments") or [])
-                    ]
-                    language = next(
-                        (
-                            str(whisper.get("language") or "zh")
-                            for whisper in whisper_by_page.values()
-                        ),
-                        "zh",
-                    )
+                # 合并必须走 merge_bilibili_pages：各 P 时间戳按累计时长偏移，
+                # 时间轴才连贯；裸拼接会让后段时间戳从 0 重来，截图对不齐。
+                pages_for_merge = (
+                    list(subtitle_outcome.pages)
+                    if subtitle_outcome is not None and subtitle_outcome.pages
+                    else list(bili_pages_to_transcribe)
+                )
+                merged_segments, language = merge_bilibili_pages(
+                    pages_for_merge,
+                    dict(subtitle_outcome.subtitle_by_page)
+                    if subtitle_outcome is not None
+                    else {},
+                    whisper_by_page,
+                )
                 transcript_result = {
                     "segments": merged_segments,
                     "language": language,
                     "source": "bilibili_multi_page",
                 }
-                if not info.get("duration"):
+                merged_duration = sum(float(page.duration or 0) for page in pages_for_merge)
+                if merged_duration:
+                    info["duration"] = merged_duration
+                elif not info.get("duration"):
                     info["duration"] = sum(
                         float(whisper.get("duration") or 0)
                         for whisper in whisper_by_page.values()

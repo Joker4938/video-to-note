@@ -110,6 +110,23 @@ def _page_requested(url: str) -> int:
         return 0
 
 
+def select_bili_pages(
+    pages: Sequence[BiliPage],
+    only_pages: Sequence[int] | None,
+    url: str,
+) -> list[BiliPage]:
+    """多分 P 处理范围：only_pages 显式指定优先（无效页码直接忽略），
+    未指定或全无效时链接带 ?p=N 只取该分 P，否则处理全部分 P。"""
+    selected: list[BiliPage] = []
+    if only_pages:
+        wanted = {int(page) for page in only_pages}
+        selected = [page for page in pages if page.page in wanted]
+    if not selected:
+        p_param = _page_requested(url)
+        selected = [page for page in pages if page.page == p_param] or list(pages)
+    return selected
+
+
 def merge_bilibili_pages(
     selected_pages: Sequence[BiliPage],
     subtitle_by_page: dict[int, SubtitleResult],
@@ -347,13 +364,7 @@ class VideoProcessor:
             )
         pages = video.pages
         title = video.title
-        selected: list[BiliPage] = []
-        if only_pages:
-            wanted = {int(page) for page in only_pages}
-            selected = [page for page in pages if page.page in wanted]
-        if not selected:
-            p_param = _page_requested(url)
-            selected = [page for page in pages if page.page == p_param] or list(pages)
+        selected = select_bili_pages(pages, only_pages, url)
         if not self._cookie_header(cookie):
             return BiliSubtitleOutcome(
                 None,

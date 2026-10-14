@@ -1641,6 +1641,263 @@ async def test_pipeline_passes_bilibili_pages_to_subtitle_fetch(
     assert captured["only_pages"] == [1, 2]
 
 
+def test_normalize_source_url_keeps_bili_page_param() -> None:
+    """B 站 ?p= 参与身份识别：不同分 P 不是同一链接，其余分享参数照旧剥掉。"""
+    base = "https://www.bilibili.com/video/BV1xx"
+    assert main.normalize_source_url(base + "?p=14") == base + "?p=14"
+    assert main.normalize_source_url(base + "?p=33&spm_id_from=333.999") == base + "?p=33"
+    assert main.normalize_source_url(base + "?spm_id_from=333.999") == base
+    assert main.normalize_source_url(base + "?p=14") != main.normalize_source_url(
+        base + "?p=33"
+    )
+    assert (
+        main.normalize_source_url("https://example.com/v?a=1")
+        == "https://example.com/v?a=1"
+    )
+
+
+def test_find_reusable_task_requires_same_page_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """转录复用要对齐 ?p= 与显式分 P 勾选：串页复用会让笔记整篇内容错位。"""
+    import os
+
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+
+    def make_task(name: str, source_url: str, bilibili_pages, mtime: float) -> None:
+        path = tmp_path / name
+        path.mkdir()
+        (path / "task.json").write_text(
+            json.dumps({"source_url": source_url, "bilibili_pages": bilibili_pages}),
+            encoding="utf-8",
+        )
+        (path / "transcript.json").write_text(
+            '{"segments": [{"start": 0, "end": 1, "text": "x"}]}', encoding="utf-8"
+        )
+        os.utime(path, (mtime, mtime))
+
+    make_task("t_p33", "https://www.bilibili.com/video/BV1xx?p=33", None, 2_000)
+    make_task(
+        "t_group",
+        "https://www.bilibili.com/video/BV1xx?p=14",
+        [14, 15, 16, 17],
+        3_000,
+    )
+
+    # ?p=14 单 P：既不能吃组任务的合并转录，更不能串到 ?p=33 去
+    assert main.find_reusable_task("https://www.bilibili.com/video/BV1xx?p=14") is None
+    # 同页同勾选（分享参数不算身份）：可复用
+    assert (
+        main.find_reusable_task(
+            "https://www.bilibili.com/video/BV1xx?p=33&spm_id_from=x"
+        )
+        == "t_p33"
+    )
+    # 组任务只有勾选完全一致才复用
+    assert (
+        main.find_reusable_task(
+            "https://www.bilibili.com/video/BV1xx?p=14", [14, 15, 16, 17]
+        )
+        == "t_group"
+    )
+    assert (
+        main.find_reusable_task("https://www.bilibili.com/video/BV1xx?p=14", [14]) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_keeps_multipage_merge_when_generic_subtitles_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """显式勾了分 P 时，单页平台字幕不能把合并任务缩回一个 P（真实事故形态）。"""
+    processor = VideoProcessor(tmp_path)
+
+    async def fake_info(*args, **kwargs):
+        return {
+            "title": "分P测试视频",
+            "source": "bilibili",
+            "duration": 150,
+            "owner": "作者",
+        }
+
+    async def fake_generic_subtitles(*args, **kwargs):
+        # 生产事故形态：URL ?p=14 的单页字幕存在，走捷径就丢掉其余勾选的 P
+        return SubtitleResult(
+            [TranscriptSegment(0, 5, "P14字幕")], "zh-CN", "bilibili_subtitle"
+        )
+
+    captured: dict = {}
+
+    async def fake_bili_subtitles(url, cookie=None, only_pages=None):
+        captured["only_pages"] = only_pages
+        pages = (
+            BiliPage(page=14, part="学习路线", cid=114, duration=60),
+            BiliPage(page=15, part="项目一", cid=115, duration=90),
+        )
+        sub14 = SubtitleResult(
+            [TranscriptSegment(0, 5, "P14字幕")], "zh-CN", "bilibili_ai_subtitle"
+        )
+        sub15 = SubtitleResult(
+            [TranscriptSegment(0, 4, "P15字幕")], "zh-CN", "bilibili_ai_subtitle"
+        )
+        merged, _ = main.merge_bilibili_pages(pages, {14: sub14, 15: sub15}, {})
+        return BiliSubtitleOutcome(
+            SubtitleResult(merged, "zh-CN", "bilibili_ai_subtitle"),
+            "ok",
+            title="分P测试视频",
+            total_pages=2,
+            pages=pages,
+            subtitle_by_page=((14, sub14), (15, sub15)),
+        )
+
+    captured_segments: list = []
+
+    class FakeSummarizer:
+        def __init__(self, **kwargs):
+            pass
+
+        def describe_effort(self, reasoning_effort: str, style: str) -> str:
+            return reasoning_effort
+
+        async def generate_summary(
+            self, title, segments, metadata, style="detailed", reasoning_effort="auto",
+            progress_callback=None, should_abort=None,
+        ):
+            captured_segments.extend(segments)
+            return "# 测试笔记\n\n[00:00] 摘要"
+
+    monkeypatch.setattr(processor, "get_video_info", fake_info)
+    monkeypatch.setattr(processor, "fetch_subtitles", fake_generic_subtitles)
+    monkeypatch.setattr(processor, "fetch_bilibili_subtitles", fake_bili_subtitles)
+    monkeypatch.setattr(main, "video_processor", processor)
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "LLMSummarizer", FakeSummarizer)
+
+    task_id = "multi-p-generic-shortcircuit"
+    (tmp_path / task_id).mkdir()
+    main.tasks[task_id] = main.new_task()
+    request = main.SummarizeRequest(
+        video_url="https://www.bilibili.com/video/BV1xx?p=14",
+        bilibili_pages=[14, 15],
+        llm_config=main.LLMConfig(model_type="deepseek", api_key="test-key"),
+    )
+
+    await main.process_video_task(task_id, request)
+
+    task = main.tasks[task_id]
+    assert task["status"] == "completed"
+    assert captured["only_pages"] == [14, 15]
+    assert task["result"]["transcript_source"] == "bilibili_ai_subtitle"
+    texts = [seg.text for seg in captured_segments]
+    assert any(t.startswith("【P14 学习路线】") for t in texts)
+    assert any(t.startswith("【P15 项目一】") for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_transcribes_selected_pages_without_subtitles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prefer_subtitles=false 也要按勾选范围逐 P 转写合并，不能只转 URL 那个 P。"""
+    processor = VideoProcessor(tmp_path)
+
+    async def fake_info(*args, **kwargs):
+        return {
+            "title": "分P测试视频",
+            "source": "bilibili",
+            "duration": 0,
+            "owner": "作者",
+        }
+
+    async def fail_subtitles(*args, **kwargs):
+        raise AssertionError("prefer_subtitles=false 不应查平台字幕")
+
+    async def fail_bili_subtitles(*args, **kwargs):
+        raise AssertionError("prefer_subtitles=false 不应走 AI 字幕通道")
+
+    async def fake_video_pages(url, cookie=None):
+        return BiliVideoInfo(
+            "BV1xx",
+            123,
+            "分P测试视频",
+            (
+                BiliPage(page=14, part="学习路线", cid=114, duration=60),
+                BiliPage(page=15, part="项目一", cid=115, duration=90),
+            ),
+        )
+
+    downloaded: list[str] = []
+
+    async def fake_download(url, task_id, cookie=None, media_name="audio", **kwargs):
+        downloaded.append(url)
+        return tmp_path / f"{media_name}.mp3"
+
+    captured_segments: list = []
+
+    class FakeTranscriber:
+        async def transcribe(
+            self, media_path, model_name="base", use_gpu=False,
+            initial_prompt=None, cancel_event=None, progress_callback=None,
+        ):
+            text = "P15语音内容" if Path(media_path).stem == "audio_p15" else "P14语音内容"
+            return {
+                "segments": [TranscriptSegment(0, 3, text)],
+                "language": "zh",
+                "duration": 3,
+                "device": "cpu",
+                "model": "base",
+                "requested_model": "base",
+            }
+
+    class FakeSummarizer:
+        def __init__(self, **kwargs):
+            pass
+
+        def describe_effort(self, reasoning_effort: str, style: str) -> str:
+            return reasoning_effort
+
+        async def generate_summary(
+            self, title, segments, metadata, style="detailed", reasoning_effort="auto",
+            progress_callback=None, should_abort=None,
+        ):
+            captured_segments.extend(segments)
+            return "# 测试笔记\n\n[00:00] 摘要"
+
+    monkeypatch.setattr(processor, "get_video_info", fake_info)
+    monkeypatch.setattr(processor, "fetch_subtitles", fail_subtitles)
+    monkeypatch.setattr(processor, "fetch_bilibili_subtitles", fail_bili_subtitles)
+    monkeypatch.setattr(processor, "bilibili_video_pages", fake_video_pages)
+    monkeypatch.setattr(processor, "download_audio", fake_download)
+    monkeypatch.setattr(main, "video_processor", processor)
+    monkeypatch.setattr(main, "transcriber", FakeTranscriber())
+    monkeypatch.setattr(main, "WORKSPACE_DIR", tmp_path)
+    monkeypatch.setattr(main, "LLMSummarizer", FakeSummarizer)
+
+    task_id = "multi-p-whisper-only"
+    (tmp_path / task_id).mkdir()
+    main.tasks[task_id] = main.new_task()
+    request = main.SummarizeRequest(
+        video_url="https://www.bilibili.com/video/BV1xx?p=14",
+        bilibili_pages=[14, 15],
+        prefer_subtitles=False,
+        llm_config=main.LLMConfig(model_type="deepseek", api_key="test-key"),
+    )
+
+    await main.process_video_task(task_id, request)
+
+    task = main.tasks[task_id]
+    assert task["status"] == "completed"
+    assert len(downloaded) == 2
+    assert downloaded[0].endswith("?p=14")
+    assert downloaded[1].endswith("?p=15")
+    assert any("按显式分 P 选择逐 P 语音转写" in log for log in task["logs"])
+    texts = [seg.text for seg in captured_segments]
+    assert any(t.startswith("【P14 学习路线】") for t in texts)
+    assert any(t.startswith("【P15 项目一】") for t in texts)
+    # 各 P 时间戳要按累计时长偏移：P15 首段落在 P14 的 60s 之后
+    p15 = next(seg for seg in captured_segments if seg.text.startswith("【P15"))
+    assert p15.start == 60.0
+
+
 @pytest.mark.asyncio
 async def test_single_part_task_archives_under_the_part_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
