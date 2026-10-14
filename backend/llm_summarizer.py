@@ -5,10 +5,12 @@ import inspect
 import os
 import re
 import time
+import urllib.request
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from html import unescape as _html_unescape
 from typing import Any, Sequence
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from .transcript import (
     TranscriptSegment,
@@ -314,6 +316,181 @@ def _is_connect_failure(exc: Exception | None) -> bool:
 ProgressCallback = Callable[[int, str], Awaitable[None] | None]
 
 
+# ── 模型补充内容的联网核验 ──────────────────────────────────────────────
+# 用户明确要求：token 管够、资料质量优先，"模型补充"不能只靠免责声明了事，
+# 必须真的上网核验。流程：从点评里抽出带「模型补充」标注的断言 → 检索佐证
+# （Bing HTML 优先、DuckDuckGo 兜底，纯 urllib 无第三方依赖）→ 第二次模型调用
+# 按证据改写（证实→正常叙述+来源、矛盾→改正、查不到→删除或标"未经证实"），
+# 并删掉整段总括免责声明。检索完全不可用时才保留旧免责声明（诚实兜底）。
+
+MODEL_ADDITION_MARK = "模型补充"
+# 免责声明整句（成稿里由模型自发写出的总括句，行内或段末皆可）
+_DISCLAIMER_RE = re.compile(
+    r"[（(]\s*本文中所有标注[^\n）)]{0,80}?[）)]\s*"
+    r"|本文中所有标注[^\n]{0,80}?事实。\s*"
+)
+# 带「模型补充」标注的括号片段：（模型补充，未联网核验：……）、〔模型补充，未联网核验〕
+_MODEL_SPAN_RE = re.compile(
+    r"[（〔(【][^（〕)】\n]{0,20}模型补充[^）〕)】\n]{0,400}[）〕)】]"
+)
+_MARKER_LABEL_RE = re.compile(
+    r"^(?:以下为)?模型补充[^：:]{0,12}[：:]\s*"
+)
+# 只有标注本身（「模型补充，未联网核验」），括号里没有正文——被标注的是前后句子
+_MARKER_BARE_RE = re.compile(r"^(?:以下为)?模型补充[^。！？!?\n]*$")
+_SEARCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+SEARCH_TIMEOUT_SECONDS = 8.0
+SEARCH_MAX_CLAIMS = 6
+SEARCH_MAX_RESULTS_PER_CLAIM = 3
+
+
+def strip_disclaimer(text: str) -> str:
+    """删掉「本文中所有标注……」总括免责声明（核验成功后不再需要）。"""
+    return _DISCLAIMER_RE.sub("", text).strip()
+
+
+def _strip_html(html_text: str) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", html_text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", _html_unescape(text)).strip()
+
+
+def extract_model_additions(analysis: str) -> list[str]:
+    """抽出「模型补充」标注的断言文本，供检索核验。
+
+    两种形态：括号标注（内容在标注括号里，取冒号后的正文）与裸标注
+    （括号里只有「模型补充，未联网核验」，被标注的是前半句）。
+    """
+    claims: list[str] = []
+    # 免责声明句里也含「模型补充」字样，先删掉再抽取，否则它自己会被当成断言
+    for para in re.split(r"\n\s*\n", strip_disclaimer(analysis)):
+        if MODEL_ADDITION_MARK not in para:
+            continue
+        spans = list(_MODEL_SPAN_RE.finditer(para))
+        if not spans:
+            cleaned = re.sub(r"模型补充[^。！？!?\n]{0,12}", "", para)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                claims.append(cleaned)
+            continue
+        for span in spans:
+            inner = span.group(0)[1:-1]
+            content = _MARKER_LABEL_RE.sub("", inner).strip()
+            if content and not _MARKER_BARE_RE.match(content):
+                claims.append(content)
+                continue
+            # 裸标注：断言是标注所在的那句话（标注前的文本）。
+            # 句号常在括号标注前（「…场景。（模型补充，未联网核验）」），
+            # 所以先吃掉尾部句读，再取最后一整句。
+            before = para[: span.start()].rstrip()
+            before = before.rstrip("。．.！!？?；;，,、")
+            sentence = re.split(r"[。！？!?\n]", before)[-1].strip()
+            if sentence:
+                claims.append(sentence)
+    # 去重、限流查询数
+    unique: list[str] = []
+    for claim in claims:
+        claim = claim.strip()
+        if claim and claim not in unique:
+            unique.append(claim)
+    return unique[:SEARCH_MAX_CLAIMS]
+
+
+def _claim_query(claim: str) -> str:
+    """断言 → 检索词：取首句、压掉引用与空白，控制在 ~60 字。"""
+    first = re.split(r"[。；;]", claim)[0]
+    first = re.sub(r"[「『\"'“”‘’\[\]【】()（）]", " ", first)
+    first = re.sub(r"\s+", " ", first).strip()
+    return first[:60] if first else claim[:60]
+
+
+def _parse_bing_results(page: str, max_results: int) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    for chunk in page.split('class="b_algo"')[1:]:
+        head = chunk[:2000]
+        link = re.search(r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"', head)
+        if not link:
+            continue
+        title_m = re.search(r"<h2[^>]*>\s*<a[^>]*>([\s\S]*?)</a>", head)
+        snippet_m = re.search(r"<p[^>]*>([\s\S]*?)</p>", head)
+        results.append(
+            {
+                "title": _strip_html(title_m.group(1)) if title_m else "",
+                "url": link.group(1),
+                "snippet": _strip_html(snippet_m.group(1)) if snippet_m else "",
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _parse_ddg_results(page: str, max_results: int) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    for chunk in re.split(r'class="result__a"', page)[1:]:
+        head = chunk[:1500]
+        link = re.search(r'href="([^"]+)"', head)
+        title_m = re.search(r">([\s\S]*?)</a>", head)
+        snippet_m = re.search(r'class="result__snippet"[^>]*>([\s\S]*?)</', chunk)
+        if not link:
+            continue
+        url = link.group(1)
+        # DDG 跳转链接里才是真实地址
+        m = re.search(r"[?&]uddg=([^&]+)", url)
+        if m:
+            url = unquote(m.group(1))
+        results.append(
+            {
+                "title": _strip_html(title_m.group(1)) if title_m else "",
+                "url": url,
+                "snippet": _strip_html(snippet_m.group(1)) if snippet_m else "",
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def web_search(query: str, max_results: int = SEARCH_MAX_RESULTS_PER_CLAIM) -> list[dict[str, str]]:
+    """联网检索。Bing HTML 优先，DuckDuckGo 兜底；失败返回 []（由调用方决定兜底）。
+
+    纯 urllib 同步实现——请用 ``asyncio.to_thread`` 从 async 管线调用。
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    engines = (
+        (
+            f"https://cn.bing.com/search?q={quote(query)}&setlang=zh-hans",
+            _parse_bing_results,
+        ),
+        (
+            f"https://html.duckduckgo.com/html/?q={quote(query)}",
+            _parse_ddg_results,
+        ),
+    )
+    for url, parse in engines:
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": _SEARCH_UA,
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=SEARCH_TIMEOUT_SECONDS) as response:
+                page = response.read().decode("utf-8", "replace")
+            results = parse(page, max_results)
+            if results:
+                return results
+        except Exception:
+            continue
+    return []
+
+
 class LLMSummarizer:
     def __init__(
         self,
@@ -561,6 +738,15 @@ class LLMSummarizer:
                     if not _looks_rate_limited(exc):
                         break
             if analysis.strip():
+                # 质量优先：点评里的「模型补充」断言先联网核验再并入正文
+                analysis = await self._verify_model_additions(
+                    title,
+                    analysis,
+                    reasoning_effort,
+                    style,
+                    progress_callback,
+                    should_abort,
+                )
                 draft = f"{draft.rstrip()}\n\n{analysis.lstrip()}"
             else:
                 self.warnings.append(f"点评与分析未生成（{reason}），笔记正文不受影响")
@@ -1976,12 +2162,99 @@ Markdown 脚注集中说明。不要在正文反复插入“原文如此”或�
     def _analysis_prompt(title: str, draft: str) -> str:
         return f"""请针对这份视频笔记所对应的视频内容本身，补写一段独立的点评与分析，只输出可直接追加到笔记后的 Markdown。
 
-点评对象是视频里的内容，而不是笔记的写法：作者的核心观点与立场是否成立、论据与例证是否充分、论证逻辑是否严密、结论是否可靠，以及内容的信息价值、适用场景和值得进一步思考的问题。可以补充有助于理解的稳定背景知识，但必须标明“模型补充，未联网核验”，不得把它写成视频原话或已核实事实。语气中性自然，服务于理解内容，避免复述已有笔记；不要评价笔记的组织结构、文笔或排版。
+点评对象是视频里的内容，而不是笔记的写法：作者的核心观点与立场是否成立、论据与例证是否充分、论证逻辑是否严密、结论是否可靠，以及内容的信息价值、适用场景和值得进一步思考的问题。可以补充有助于理解的稳定背景知识，用「模型补充：」标出（成稿后会联网核验改写），不要把它写成视频原话或已核实事实；不要添加“未联网核验”或“本文中所有标注……”之类的免责声明句。语气中性自然，服务于理解内容，避免复述已有笔记；不要评价笔记的组织结构、文笔或排版。
 
 标题：{title}
 
 已有笔记：
 {draft}"""
+
+    @staticmethod
+    def _verify_prompt(title: str, analysis: str, evidence: str) -> str:
+        return f"""下面是视频笔记的「点评与分析」，其中标注「模型补充」的背景知识已联网检索。请逐条核验并改写整段点评，只输出改写后的 Markdown 全文：
+
+1. 检索证实的背景知识：去掉「模型补充」标注，改写成正常叙述，并在句末标注「（来源：站点名或标题）」；
+2. 与检索结果矛盾的：按事实改正，同样标注来源；
+3. 检索不到依据的：直接删除；确属理解所必需时才保留，并写明「（未经证实）」；
+4. 删除「本文中所有标注……」之类的总括免责声明句子；
+5. 分析性观点（价值判断、适用场景、值得思考的问题）不是事实断言，不要求来源，保留原意即可；
+6. 不要把观点改写成事实断言，语气保持中性，不要复述笔记正文。
+
+视频标题：{title}
+
+原点评与分析：
+{analysis}
+
+联网检索结果（每条断言一组，标注「（无检索结果）」的即查不到依据）：
+{evidence}"""
+
+    async def _verify_model_additions(
+        self,
+        title: str,
+        analysis: str,
+        reasoning_effort: str,
+        style: str,
+        progress_callback: ProgressCallback | None,
+        should_abort: Callable[[], bool] | None,
+    ) -> str:
+        """对点评里「模型补充」标注的断言联网核验后改写。
+
+        质量优先（用户明确要求）：不再靠免责声明了事。检索完全不可用时保留
+        旧免责声明兜底——那是诚实的降级，不是内容降级；只要检索活着就走改写。
+        """
+        claims = extract_model_additions(analysis)
+        if not claims:
+            # 没有待核验断言：顺手删掉空免责句（它声称标注了“模型补充”，实际没有）
+            return strip_disclaimer(analysis)
+
+        evidence_parts: list[str] = []
+        searched_any = False
+        for index, claim in enumerate(claims, 1):
+            if should_abort is not None and should_abort():
+                raise asyncio.CancelledError("任务已取消")
+            query = _claim_query(claim)
+            results = await asyncio.to_thread(web_search, query)
+            if results:
+                searched_any = True
+            lines = [f"【断言 {index}】{claim}"]
+            for item in results:
+                lines.append(
+                    f"- {item['title']}｜{item['url']}｜{item['snippet'][:200]}"
+                )
+            if not results:
+                lines.append("- （无检索结果）")
+            evidence_parts.append("\n".join(lines))
+
+        if not searched_any:
+            # 一条都没检索到可用结果：视为检索通道不可用，保留标注与免责声明
+            if _DISCLAIMER_RE.search(analysis):
+                return analysis
+            return (
+                analysis.rstrip()
+                + "\n\n（本文中所有标注“模型补充”的内容均未联网核验，仅供理解参考，"
+                "不应视为视频原话或已证实事实。）"
+            )
+
+        try:
+            rewritten = await self._complete(
+                self._verify_prompt(title, analysis, "\n\n".join(evidence_parts)),
+                max_tokens=6_000,
+                effort=self._stage_effort(reasoning_effort, style, "analysis"),
+                progress_callback=progress_callback,
+                progress=96,
+                stage="正在联网核验补充内容",
+                should_abort=should_abort,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.warnings.append(
+                f"补充内容核验改写失败（{type(exc).__name__}: {exc}），保留原标注"
+            )
+            return analysis
+        if not rewritten.strip():
+            return analysis
+        return strip_disclaimer(rewritten)
 
     @staticmethod
     def _normalize_timestamp_delimiters(text: str) -> str:

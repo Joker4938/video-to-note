@@ -116,7 +116,10 @@ def test_note_and_analysis_prompts_are_focused() -> None:
     assert "Markdown 脚注" in prompt
     assert "原文如此" in prompt
     assert "不必凑固定模板" in prompt
-    assert "模型补充，未联网核验" in analysis
+    # 「模型补充」只做标注（后续联网核验改写），不再要求/允许免责声明句
+    assert "模型补充" in analysis
+    assert "会联网核验改写" in analysis
+    assert "免责声明" in analysis
     assert "点评对象是视频里的内容" in analysis
     assert "不要评价笔记的组织结构" in analysis
     assert "语气中性自然" in analysis
@@ -1873,6 +1876,141 @@ async def test_dropped_stream_with_partial_content_is_not_retried() -> None:
     with pytest.raises(RuntimeError, match="peer closed"):
         await summarizer._complete("测试", 800, "high")
     assert summarizer.warnings == []
+
+
+# ------------------------------------------------- 「模型补充」联网核验（用户要求：质量优先，不靠免责声明了事）
+
+
+def test_extract_model_additions_covers_both_marker_shapes() -> None:
+    from backend.llm_summarizer import extract_model_additions
+
+    analysis = (
+        "视频讲了工具A的取舍。（模型补充，未联网核验：ComfyUI 是基于节点图的 Stable Diffusion 工作流工具。）\n\n"
+        "结论是它适合轻量场景。（模型补充，未联网核验）\n\n"
+        "以上是点评。"
+    )
+    claims = extract_model_additions(analysis)
+    assert len(claims) == 2
+    assert "ComfyUI" in claims[0]
+    assert "未联网核验" not in claims[0]
+    # 裸标注：断言是被标注的那句话
+    assert "结论是它适合轻量场景" in claims[1]
+
+
+def test_strip_disclaimer_removes_only_the_blanket_sentence() -> None:
+    from backend.llm_summarizer import strip_disclaimer
+
+    text = (
+        "点评正文。\n\n"
+        "（本文中所有标注“模型补充”的内容均未联网核验，仅供理解参考，不应视为视频原话或已证实事实。）\n"
+    )
+    assert "点评正文" in strip_disclaimer(text)
+    assert "未联网核验" not in strip_disclaimer(text)
+
+
+def test_parse_search_results_extracts_title_link_snippet() -> None:
+    from backend.llm_summarizer import _parse_bing_results, _parse_ddg_results
+
+    bing_page = (
+        '<li class="b_algo"><h2><a href="https://example.test/a">标题A</a></h2>'
+        "<p>摘要A，说明事实。</p></li>"
+    )
+    results = _parse_bing_results(bing_page, 3)
+    assert results[0]["url"] == "https://example.test/a"
+    assert results[0]["title"] == "标题A"
+    assert "摘要A" in results[0]["snippet"]
+
+    ddg_page = (
+        '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.test%2Fb">'
+        "标题B</a>"
+        '<a class="result__snippet">摘要B</a>'
+    )
+    results = _parse_ddg_results(ddg_page, 3)
+    assert results[0]["url"] == "https://example.test/b"
+    assert results[0]["title"] == "标题B"
+
+
+@pytest.mark.asyncio
+async def test_verify_rewrites_analysis_with_sources_and_drops_disclaimer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend import llm_summarizer as module
+
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    prompts: list[str] = []
+
+    async def complete(prompt, max_tokens, effort="auto", **kwargs):
+        prompts.append(prompt)
+        return "## 点评与分析\n\n工具定位明确。（来源：官方文档）\n\n以上是分析。"
+
+    summarizer._complete = complete
+    monkeypatch.setattr(
+        module,
+        "web_search",
+        lambda query, max_results=3: [
+            {"title": "官方文档", "url": "https://example.test/doc", "snippet": "事实依据"}
+        ],
+    )
+    analysis = (
+        "## 点评与分析\n\n（模型补充，未联网核验：工具定位明确。）\n\n"
+        "（本文中所有标注“模型补充”的内容均未联网核验，仅供理解参考，不应视为视频原话或已证实事实。）"
+    )
+
+    result = await summarizer._verify_model_additions("标题", analysis, "auto", "detailed", None, None)
+
+    assert "（来源：官方文档）" in result
+    assert "未联网核验" not in result
+    assert len(prompts) == 1
+    assert "联网检索结果" in prompts[0]
+    assert "工具定位明确" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_verify_keeps_honest_fallback_when_search_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend import llm_summarizer as module
+
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+
+    async def complete(prompt, **kwargs):
+        raise AssertionError("检索完全失败时不应调用改写模型")
+
+    summarizer._complete = complete
+    monkeypatch.setattr(module, "web_search", lambda query, max_results=3: [])
+    analysis = "## 点评与分析\n\n（模型补充，未联网核验：工具定位明确。）"
+
+    result = await summarizer._verify_model_additions("标题", analysis, "auto", "detailed", None, None)
+
+    assert "模型补充" in result
+    assert "不应视为视频原话或已证实事实" in result  # 免责声明兜底仍在
+
+
+@pytest.mark.asyncio
+async def test_verify_strips_stray_disclaimer_even_without_claims() -> None:
+    from backend import llm_summarizer as module
+
+    summarizer = object.__new__(LLMSummarizer)
+    summarizer.warnings = []
+    monkeypatch_calls = []
+
+    async def complete(prompt, **kwargs):
+        monkeypatch_calls.append(prompt)
+        return "不应被调用"
+
+    summarizer._complete = complete
+    analysis = (
+        "## 点评与分析\n\n纯粹的点评。\n\n"
+        "（本文中所有标注“模型补充”的内容均未联网核验，仅供理解参考，不应视为视频原话或已证实事实。）"
+    )
+
+    result = await summarizer._verify_model_additions("标题", analysis, "auto", "detailed", None, None)
+
+    assert "纯粹的点评" in result
+    assert "未联网核验" not in result
+    assert monkeypatch_calls == []
 
 
 # ------------------------------------------------- 测试连接的绕代理重试（1.4.2「重启电脑才行」悬案的对症路）
