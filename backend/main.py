@@ -891,6 +891,19 @@ def task_status_payload(task_id: str, task: dict[str, Any]) -> dict[str, Any]:
         manifest,
         str(task.get("output") or manifest.get("output") or "note"),
     )
+    # 归档后的笔记允许外部再加工（例如 shotfill 按小节时间戳补内容对齐截图）：
+    # 磁盘上的 notes.md 是正文的唯一权威（与 /api/download、重启恢复同源）。
+    # 完成态任务优先读盘，否则网页端停留在完成那一瞬的旧正文，看不到后补的截图。
+    if task.get("status") == "completed" and isinstance(result, dict):
+        try:
+            notes_path = task_directory(task_id) / "notes.md"
+            if notes_path.is_file():
+                payload["result"] = {
+                    **result,
+                    "markdown": notes_path.read_text(encoding="utf-8"),
+                }
+        except (OSError, ValueError):
+            pass
     return payload
 
 

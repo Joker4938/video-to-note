@@ -30,6 +30,8 @@ SEC_RE = re.compile(
     r"(\d{1,2}:\d{2}(?::\d{2})?)\]\s*$", re.M)
 SRC_RE = re.compile(r"^来源：\s*(\S+)", re.M)
 BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
+# screenshots may link images/<bvid>/…（兜底）or ../<task_id>/frames/…（服务方案）
+SHOT_RE = re.compile(r"!\[[^\]]*\]\([^)]*(?:images|frames)/[^)]*\)")
 THIN_CHARS = 1500
 
 
@@ -62,7 +64,7 @@ def main():
         ends = [parse_ts(sm.group(3)) for sm in SEC_RE.finditer(text)]
         if not ends:
             tags.append("NO-TS")
-        if "](images/" not in text:
+        if not SHOT_RE.search(text):
             tags.append("NO-SHOT")
         bvid = ""
         if m:

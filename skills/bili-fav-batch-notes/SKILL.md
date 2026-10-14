@@ -66,8 +66,13 @@ python "<本技能目录>/scripts/shotfill.py"           # 扫全部缺截图的
 python "<本技能目录>/scripts/shotfill.py" <笔记路径>  # 单篇
 ```
 
-- 解析 `## 标题 [MM:SS-MM:SS]`，每约 2 分钟跨度取 1 帧（小节中点，上限 4 帧/节），yt-dlp 下载 ≤720p，ffmpeg 抽帧存 `notes/images/<bvid>/`，图片链接注入标题下方。
-- 幂等：已有 `](images/` 的笔记跳过。批量跑时建议挂循环（每 3 分钟一轮），新笔记落盘后自动补图。
+- 解析 `## 标题 [MM:SS-MM:SS]`，每约 2 分钟跨度取 1 帧（小节中点，上限 4 帧/节），yt-dlp 下载 ≤720p，ffmpeg 抽帧。
+- **落盘走服务原生截图方案**，保证网页端/导出/磁盘三种查看方式都能显示：
+  - 帧写入 `workspace/<task_id>/frames/<bvid>_sNN_MMmSSs.jpg`（与服务自带截图同目录）；
+  - 归档笔记（`workspace/notes/<title>.md`）里链接为 `../<task_id>/frames/<file>`（从 notes/ 目录就地看图）；
+  - 同步回写任务目录镜像 `workspace/<task_id>/notes.md`（链接 `./frames/<file>`），网页端按 `/api/image/<task_id>/<file>` 渲染。**不回写镜像，网页端就看不到图**。
+  - 没有已完成服务任务的兜底笔记（agent 手写稿）用便携方案 `notes/images/<bvid>/`。
+- 幂等：已有截图链接的笔记跳过补帧，但仍会**回写/刷新任务镜像**（旧版 `images/<bvid>/` 方案的笔记会自动迁移到任务 frames 方案）。批量跑时建议挂循环（每 3 分钟一轮），新笔记落盘后自动补图。
 - 依赖：`yt-dlp`（pip）、`ffmpeg/ffprobe`（PATH 或 `FFMPEG`/`FFPROBE` 环境变量）。cookie 从服务在内存里取，不落盘。
 
 ## 第 5 步：质检
@@ -118,6 +123,7 @@ python "<本技能目录>/scripts/notes_audit.py" favs.json
 | 转写只有 `...` 占位 | 视频无解说语音；走第 6 步抽帧兜底，别反复重转写 |
 | 同视频出现 `-2.md` | 孪生提交；删多余的，检查是否两个驱动在跑 |
 | 笔记无 `## xxx [MM:SS-MM:SS]` | 出稿没按时间戳版式（或空转写占位稿）；兜底重写 |
+| 归档 .md 有截图，但网页端/任务目录里看不到 | 截图只写进了归档、没回写任务镜像；重跑 `shotfill.py` 自动迁移到 `frames/` + 镜像方案 |
 | 控制台 UnicodeEncodeError | Windows GBK；脚本已 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` |
 | 并行提交任务 | 服务默认单任务队列；串行等待，避免孪生与 GPU 争抢 |
 
